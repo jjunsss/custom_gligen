@@ -18,6 +18,12 @@ import torchvision.transforms.functional as F
 import torchvision.transforms.functional as TF
 import torchvision.transforms as transforms
 
+#! for DDP
+import torch.distributed as dist
+import utils
+import random, json, sys
+from tqdm import tqdm
+
 device = "cuda"
 
 
@@ -85,7 +91,16 @@ def load_ckpt(ckpt_path):
 
     return model, autoencoder, text_encoder, diffusion, config
 
+def create_empty_models(ckpt_path):
+    saved_ckpt = torch.load(ckpt_path, map_location='cpu')
+    config = saved_ckpt["config_dict"]["_content"]
 
+    model = instantiate_from_config(config['model']).to(device).eval()
+    autoencoder = instantiate_from_config(config['autoencoder']).to(device).eval()
+    text_encoder = instantiate_from_config(config['text_encoder']).to(device).eval()
+    diffusion = instantiate_from_config(config['diffusion']).to(device)
+
+    return model, autoencoder, text_encoder, diffusion, config
 
 
 def project(x, projection_matrix):
@@ -142,50 +157,101 @@ def complete_mask(has_mask, max_objs):
 
 
 
-@torch.no_grad()
-def prepare_batch(meta, batch=1, max_objs=30):
-    phrases, images = meta.get("phrases"), meta.get("images")
-    images = [None]*len(phrases) if images==None else images 
-    phrases = [None]*len(images) if phrases==None else phrases 
+# @torch.no_grad()
+# def prepare_batch(meta, batch=1, max_objs=30):
+#     phrases, images = meta.get("phrases"), meta.get("images")
+#     images = [None]*len(phrases) if images==None else images 
+#     phrases = [None]*len(images) if phrases==None else phrases 
 
-    version = "openai/clip-vit-large-patch14"
-    model = CLIPModel.from_pretrained(version).cuda()
-    processor = CLIPProcessor.from_pretrained(version)
+#     version = "openai/clip-vit-large-patch14"
+#     model = CLIPModel.from_pretrained(version).cuda()
+#     processor = CLIPProcessor.from_pretrained(version)
 
-    boxes = torch.zeros(max_objs, 4)
-    masks = torch.zeros(max_objs)
-    text_masks = torch.zeros(max_objs)
-    image_masks = torch.zeros(max_objs)
-    text_embeddings = torch.zeros(max_objs, 768)
-    image_embeddings = torch.zeros(max_objs, 768)
+#     boxes = torch.zeros(max_objs, 4)
+#     masks = torch.zeros(max_objs)
+#     text_masks = torch.zeros(max_objs)
+#     image_masks = torch.zeros(max_objs)
+#     text_embeddings = torch.zeros(max_objs, 768)
+#     image_embeddings = torch.zeros(max_objs, 768)
     
-    text_features = []
-    image_features = []
-    for phrase, image in zip(phrases,images):
-        text_features.append(  get_clip_feature(model, processor, phrase, is_image=False) )
-        image_features.append( get_clip_feature(model, processor, image,  is_image=True) )
+#     text_features = []
+#     image_features = []
+#     for phrase, image in zip(phrases,images):
+#         text_features.append(  get_clip_feature(model, processor, phrase, is_image=False) )
+#         image_features.append( get_clip_feature(model, processor, image,  is_image=True) )
 
-    for idx, (box, text_feature, image_feature) in enumerate(zip( meta['locations'], text_features, image_features)):
-        boxes[idx] = torch.tensor(box)
-        masks[idx] = 1
-        if text_feature is not None:
-            text_embeddings[idx] = text_feature
-            text_masks[idx] = 1 
-        if image_feature is not None:
-            image_embeddings[idx] = image_feature
-            image_masks[idx] = 1 
+#     for idx, (box, text_feature, image_feature) in enumerate(zip( meta['locations'], text_features, image_features)):
+#         boxes[idx] = torch.tensor(box)
+#         masks[idx] = 1
+#         if text_feature is not None:
+#             text_embeddings[idx] = text_feature
+#             text_masks[idx] = 1 
+#         if image_feature is not None:
+#             image_embeddings[idx] = image_feature
+#             image_masks[idx] = 1 
 
-    out = {
-        "boxes" : boxes.unsqueeze(0).repeat(batch,1,1),
-        "masks" : masks.unsqueeze(0).repeat(batch,1),
-        "text_masks" : text_masks.unsqueeze(0).repeat(batch,1)*complete_mask( meta.get("text_mask"), max_objs ),
-        "image_masks" : image_masks.unsqueeze(0).repeat(batch,1)*complete_mask( meta.get("image_mask"), max_objs ),
-        "text_embeddings"  : text_embeddings.unsqueeze(0).repeat(batch,1,1),
-        "image_embeddings" : image_embeddings.unsqueeze(0).repeat(batch,1,1)
-    }
+#     out = {
+#         "boxes" : boxes.unsqueeze(0).repeat(batch,1,1),
+#         "masks" : masks.unsqueeze(0).repeat(batch,1),
+#         "text_masks" : text_masks.unsqueeze(0).repeat(batch,1)*complete_mask( meta.get("text_mask"), max_objs ),
+#         "image_masks" : image_masks.unsqueeze(0).repeat(batch,1)*complete_mask( meta.get("image_mask"), max_objs ),
+#         "text_embeddings"  : text_embeddings.unsqueeze(0).repeat(batch,1,1),
+#         "image_embeddings" : image_embeddings.unsqueeze(0).repeat(batch,1,1)
+#     }
 
-    return batch_to_device(out, device) 
+#     return batch_to_device(out, device) 
 
+@torch.no_grad()
+def prepare_batch(args, meta_list, model, processor, max_objs=30):
+	prompt_list = []
+	image_ids = []
+	out_list = []
+	for meta in meta_list:
+		phrases, images = meta.get("phrases"), meta.get("image_id")
+
+		prompt_list.append(meta["prompt"])
+		image_ids.append(meta.get("image_id"))
+
+		images = [None]*len(phrases) if images==None else [images] * len(phrases)
+		phrases = [None]*len(images) if phrases==None else phrases 
+
+		boxes = torch.zeros(max_objs, 4)
+		masks = torch.zeros(max_objs)
+		text_masks = torch.zeros(max_objs)
+		image_masks = torch.zeros(max_objs)
+		text_embeddings = torch.zeros(max_objs, 768)
+		image_embeddings = torch.zeros(max_objs, 768)
+
+		text_features = [get_clip_feature(model, processor, phrase, is_image=False) for phrase in phrases]
+		image_features = [get_clip_feature(model, processor, image, is_image=True) for image in images]
+
+		for idx, (box, text_feature, image_feature) in enumerate(zip(meta['locations'], text_features, image_features)):
+			boxes[idx] = torch.tensor(box)
+			masks[idx] = 1
+			if text_feature is not None:
+				text_embeddings[idx] = text_feature
+				text_masks[idx] = 1 
+			if image_feature is not None:
+				image_embeddings[idx] = image_feature
+				image_masks[idx] = 1 
+
+		out = {
+			"boxes": boxes.unsqueeze(0),
+			"masks": masks.unsqueeze(0),
+			"text_masks": text_masks.unsqueeze(0) * complete_mask(meta.get("text_mask"), max_objs),
+			"image_masks": image_masks.unsqueeze(0) * complete_mask(meta.get("image_mask"), max_objs),
+			"text_embeddings": text_embeddings.unsqueeze(0),
+			"image_embeddings": image_embeddings.unsqueeze(0)
+		}
+		out_list.append(out)
+
+	# Concatenate along the first dimension (batch dimension) to stack multiple batches together
+	final_output = {
+		key: torch.cat([out[key] for out in out_list], dim=0)
+		for key in out_list[0].keys()
+	}
+	del text_features, image_features, text_masks, image_masks
+	return batch_to_device(final_output, device), prompt_list, image_ids
 
 def crop_and_resize(image):
     crop_size = min(image.size)
@@ -337,14 +403,44 @@ def prepare_batch_sem(meta, batch=1):
     }
     return batch_to_device(out, device) 
 
-
+#! for ddp generation
+def broadcast_model(model):
+    for param in model.parameters():
+        dist.broadcast(param.data, src=0)
 
 @torch.no_grad()
-def run(meta, config, starting_noise=None):
+def run(meta_list, config):
+    meta = meta_list[0] #* temp allocate
+    
+    #* 잡다한 출력문 제거.(optional)
+    original_stdout = sys.stdout
+    sys.stdout = None
+    
+    #* checkpoints path
+    load_path = None #TODO: writh your path
+    load_path = meta[0]["ckpt"] #어차피 load되는 checkpoint는 모든 리스트에서 동일함.
+    
+    
+    if dist.is_main_process():
+        #* 메인 GPU에는 pth 파일을 로드.
+        model, autoencoder, text_encoder, diffusion, config = load_ckpt(load_path)
+    else:
+        #* 메인을 제외한 나머지 3개의 GPU 에는 모델 구조만 로드.
+        model, autoencoder, text_encoder, diffusion, config = create_empty_models(load_path)
+        
+    #* Synchronize all processes. main에 load되어있는 weight를 broadcating 하는 작업.(모든 모델에 weight를 불러와도 됨.)
+    if dist.get_world_size() > 1:
+        dist.barrier() #sync
 
-    # - - - - - prepare models - - - - - # 
-    model, autoencoder, text_encoder, diffusion, config = load_ckpt(meta["ckpt"])
+        # Now, non-main processes will receive the broadcasted model weights
+        broadcast_model(model)
+        broadcast_model(autoencoder)
+        broadcast_model(text_encoder)
+        broadcast_model(diffusion)
 
+        print(f"----all gpus broadcasting complete----")
+        dist.barrier() #sync
+    
     grounding_tokenizer_input = instantiate_from_config(config['grounding_tokenizer_input'])
     model.grounding_tokenizer_input = grounding_tokenizer_input
     
@@ -352,36 +448,23 @@ def run(meta, config, starting_noise=None):
     if "grounding_downsampler_input" in config:
         grounding_downsampler_input = instantiate_from_config(config['grounding_downsampler_input'])
 
-
-
     # - - - - - update config from args - - - - - # 
     config.update( vars(args) )
     config = OmegaConf.create(config)
+    
+    #* 잡다한 출력문 제거.(optional). 위 동일한 주석에서부터 여기까지의 선언 제거.
+    sys.stdout = original_stdout
 
-
-    # - - - - - prepare batch - - - - - #
-    if "keypoint" in meta["ckpt"]:
-        batch = prepare_batch_kp(meta, config.batch_size)
-    elif "hed" in meta["ckpt"]:
-        batch = prepare_batch_hed(meta, config.batch_size)
-    elif "canny" in meta["ckpt"]:
-        batch = prepare_batch_canny(meta, config.batch_size)
-    elif "depth" in meta["ckpt"]:
-        batch = prepare_batch_depth(meta, config.batch_size)
-    elif "normal" in meta["ckpt"]:
-        batch = prepare_batch_normal(meta, config.batch_size)
-    elif "sem" in meta["ckpt"]:
-        batch = prepare_batch_sem(meta, config.batch_size)
-    else:
-        batch = prepare_batch(meta, config.batch_size)
-    context = text_encoder.encode(  [meta["prompt"]]*config.batch_size  )
-    uc = text_encoder.encode( config.batch_size*[""] )
-    if args.negative_prompt is not None:
-        uc = text_encoder.encode( config.batch_size*[args.negative_prompt] )
-
+    #* Clip calling
+    version = "openai/clip-vit-large-patch14"
+    clip_model = CLIPModel.from_pretrained(version).cuda()
+    clip_processor = CLIPProcessor.from_pretrained(version)
+    
+    #* beta value. GLIGEN duration control variable.
+    temp_meta_set = [1.0, 0.0, 0.0]
 
     # - - - - - sampler - - - - - # 
-    alpha_generator_func = partial(alpha_generator, type=meta.get("alpha_type"))
+    alpha_generator_func = partial(alpha_generator, type=temp_meta_set)
     if config.no_plms:
         sampler = DDIMSampler(diffusion, model, alpha_generator_func=alpha_generator_func, set_alpha_scale=set_alpha_scale)
         steps = 250 
@@ -390,61 +473,82 @@ def run(meta, config, starting_noise=None):
         steps = 50 
 
 
-    # - - - - - inpainting related - - - - - #
-    inpainting_mask = z0 = None  # used for replacing known region in diffusion process
-    inpainting_extra_input = None # used as model input 
-    if "input_image" in meta:
-        # inpaint mode 
-        assert config.inpaint_mode, 'input_image is given, the ckpt must be the inpaint model, are you using the correct ckpt?'
+    #* TQDM install. 현재는 main GPU에서만 수행하도록 되어있음.
+    gpu_working = tqdm(total=len(meta_list), desc="generation processing", disable=not utils.is_main_process())
+    temp_meta_list = []
+    for idx, meta in enumerate(meta_list):
+        temp_meta_list.append(meta)
         
-        inpainting_mask = draw_masks_from_boxes( batch['boxes'], model.image_size  ).cuda()
+        if len(temp_meta_list) != config.batch_size:
+            continue
+        starting_noise = torch.randn(config.batch_size, 4, 64, 64).to(args.device)
         
-        input_image = F.pil_to_tensor( Image.open(meta["input_image"]).convert("RGB").resize((512,512)) ) 
-        input_image = ( input_image.float().unsqueeze(0).cuda() / 255 - 0.5 ) / 0.5
-        z0 = autoencoder.encode( input_image )
+        # - - - - - prepare batch - - - - - #
+        batch, prompt_list, image_id_list = prepare_batch(config, temp_meta_list, clip_model, clip_processor)
+        context = text_encoder.encode(prompt_list)
+        uc = text_encoder.encode( config.batch_size*[""] )
+        if args.negative_prompt is not None:
+            uc = text_encoder.encode( config.batch_size*[args.negative_prompt] )
+            
+        # - - - - - inpainting related - - - - - #
+        inpainting_mask = z0 = None  # used for replacing known region in diffusion process
+        inpainting_extra_input = None # used as model input 
+        if "input_image" in meta:
+            # inpaint mode 
+            assert config.inpaint_mode, 'input_image is given, the ckpt must be the inpaint model, are you using the correct ckpt?'
+            
+            inpainting_mask = draw_masks_from_boxes( batch['boxes'], model.image_size  ).cuda()
+            
+            input_image = F.pil_to_tensor( Image.open(meta["input_image"]).convert("RGB").resize((512,512)) ) 
+            input_image = ( input_image.float().unsqueeze(0).cuda() / 255 - 0.5 ) / 0.5
+            z0 = autoencoder.encode( input_image )
+            
+            masked_z = z0*inpainting_mask
+            inpainting_extra_input = torch.cat([masked_z,inpainting_mask], dim=1)        
+            
+        # - - - - - input for gligen - - - - - #
+        grounding_input = grounding_tokenizer_input.prepare(batch)
+        grounding_extra_input = None
+        if grounding_downsampler_input != None:
+            grounding_extra_input = grounding_downsampler_input.prepare(batch)
+
+        # - - - - - input format - - - - - - - #
+        input = dict(
+                    x = starting_noise, 
+                    timesteps = None, 
+                    context = context, 
+                    grounding_input = grounding_input,
+                    inpainting_extra_input = inpainting_extra_input,
+                    grounding_extra_input = grounding_extra_input,
+
+                )
+
+        # - - - - - start sampling - - - - - #
+        shape = (config.batch_size, model.in_channels, model.image_size, model.image_size)
+        samples_fake = sampler.sample(S=steps, shape=shape, input=input,  uc=uc, guidance_scale=config.guidance_scale, mask=inpainting_mask, x0=z0)
+        samples_fake = autoencoder.decode(samples_fake)
+
+        #TODO: 저장하는 부분은 지금은 이미지 개수에 맞춰서 번호가 들어가는데, 이미지 ID와 같이 변경하실려면 아래를 건드리면 됩니다 !
+        # - - - - - save - - - - - #
+        output_folder = os.path.join( args.folder,  meta["save_folder_name"])
+        os.makedirs( output_folder, exist_ok=True)
+        start = len( os.listdir(output_folder) )
         
-        masked_z = z0*inpainting_mask
-        inpainting_extra_input = torch.cat([masked_z,inpainting_mask], dim=1)              
-    
+        image_ids = list(range(start,start+config.batch_size))
+        print(image_ids)
+        
+        #* image_id_list는 위에서 batch에 준비할 때 noise 별 다른 meta 정보를 줘서 한 번에 batch_size 만큼 이미지를 생성하기 위한 코드를 작성해두었기 때문에,
+        #* 각각의 생성된 이미지를 따로 저장해줘야해서 할당되어있는 이미지 번호들입니다. (meta 정보에서 추출된, prepare_batch 함수를 참조하면 됩니다.)
+        for _, (img_id, sample) in enumerate(zip(image_id_list, samples_fake)):
+            
+            #TODO: image name은 원하는 형태로(저장하고 싶은 형태) 변경해서 사용하면 됩니다. 그 외의 밑에 값은 normal image와 같이 저장해주는 format이라 딱히 건드릴 필요는 없습니다. 
+            img_name = f"{img_id}.jpg"
+            sample = torch.clamp(sample, min=-1, max=1) * 0.5 + 0.5
+            sample = sample.cpu().numpy().transpose(1,2,0) * 255 
+            sample = Image.fromarray(sample.astype(np.uint8))
+            sample.save(  os.path.join(output_folder, img_name)   )
 
-    # - - - - - input for gligen - - - - - #
-    grounding_input = grounding_tokenizer_input.prepare(batch)
-    grounding_extra_input = None
-    if grounding_downsampler_input != None:
-        grounding_extra_input = grounding_downsampler_input.prepare(batch)
-
-    input = dict(
-                x = starting_noise, 
-                timesteps = None, 
-                context = context, 
-                grounding_input = grounding_input,
-                inpainting_extra_input = inpainting_extra_input,
-                grounding_extra_input = grounding_extra_input,
-
-            )
-
-
-    # - - - - - start sampling - - - - - #
-    shape = (config.batch_size, model.in_channels, model.image_size, model.image_size)
-
-    samples_fake = sampler.sample(S=steps, shape=shape, input=input,  uc=uc, guidance_scale=config.guidance_scale, mask=inpainting_mask, x0=z0)
-    samples_fake = autoencoder.decode(samples_fake)
-
-
-    # - - - - - save - - - - - #
-    output_folder = os.path.join( args.folder,  meta["save_folder_name"])
-    os.makedirs( output_folder, exist_ok=True)
-
-    start = len( os.listdir(output_folder) )
-    image_ids = list(range(start,start+config.batch_size))
-    print(image_ids)
-    for image_id, sample in zip(image_ids, samples_fake):
-        img_name = str(int(image_id))+'.png'
-        sample = torch.clamp(sample, min=-1, max=1) * 0.5 + 0.5
-        sample = sample.cpu().numpy().transpose(1,2,0) * 255 
-        sample = Image.fromarray(sample.astype(np.uint8))
-        sample.save(  os.path.join(output_folder, img_name)   )
-
+        gpu_working.update(config.batch_size)
 
 
 
@@ -453,8 +557,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--folder", type=str,  default="generation_samples", help="root folder for output")
-
-
     parser.add_argument("--batch_size", type=int, default=5, help="")
     parser.add_argument("--no_plms", action='store_true', help="use DDIM instead. WARNING: I did not test the code yet")
     parser.add_argument("--guidance_scale", type=float,  default=7.5, help="")
@@ -463,10 +565,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
 
+    #* 보통 batch_size는 4를 설정하는게 3090을 최대한 사용할 수 있습니다.
 
-    meta_list = [ 
+    custom_meta_list = [ 
 
-        # - - - - - - - - GLIGEN on text grounding for generation - - - - - - - - # 
+        # - - - - - - - - GLIGEN on text grounding for generation - - - - - - - - # tempararily
         dict(
             ckpt = "../gligen_checkpoints/checkpoint_generation_text.pth",
             prompt = "a teddy bear sitting next to a bird",
@@ -475,174 +578,31 @@ if __name__ == "__main__":
             alpha_type = [0.3, 0.0, 0.7],
             save_folder_name="generation_box_text"
         ), 
-
-
-        # - - - - - - - - GLIGEN on text grounding for inpainting - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_inpainting_text.pth",
-            input_image = "inference_images/dalle2_museum.jpg",
-            prompt = "a corgi and a cake",
-            phrases =   ['corgi', 'cake'],
-            locations = [ [0.25, 0.28, 0.42, 0.52], [0.14, 0.58, 0.58, 0.92], ], # mask will be derived from box 
-            save_folder_name="inpainting_box_text"
-        ),
-
-
-        # - - - - - - - - GLIGEN on image grounding for generation - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_generation_text_image.pth",
-            prompt = "an alarm clock sitting on the beach",
-            images = ['inference_images/clock.png'],
-            phrases = ['alarm clock'],
-            locations = [ [0.0,0.09,0.53,0.76] ],
-            alpha_type = [1.0, 0.0, 0.0],
-            save_folder_name="generation_box_image"
-        ),
-
-
-
-        # - - - - - - - - GLIGEN on text and style grounding for generation - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_generation_text_image.pth",
-            prompt = "a brick house in the woods, anime, oil painting",
-            phrases =   ['a brick house',            'placehoder'],
-            images =    ['inference_images/placeholder.png', 'inference_images/style_golden.jpg'],
-            locations = [ [0.4,0.2,1.0,0.8],         [0.0, 1.0, 0.0, 1.0] ],
-            alpha_type = [1, 0, 0],  
-            text_mask = [1,0],  # the second text feature will be masked 
-            image_mask =[0,1],  # the first image feature will be masked
-            save_folder_name="generation_box_text_style"
-        ), 
-
-
-        # - - - - - - - - GLIGEN on image grounding for inpainting - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_inpainting_text_image.pth",
-            input_image = "inference_images/beach.jpg",
-            prompt = "a bigben on the beach",
-            images = [ 'inference_images/bigben.jpg'],
-            locations = [ [0.18, 0.08, 0.62, 0.75] ], # mask will be derived from box 
-            save_folder_name="inpainting_box_image"
-        ),
-
-
-
-        # - - - - - - - - GLIGEN on hed grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_hed.pth",
-            prompt = "a man is eating breakfast",  
-            hed_image = 'inference_images/hed_man_eat.png',
-            save_folder_name="hed",
-            alpha_type = [0.9, 0, 0.1], 
-        ),
-
-
-
-
-        # - - - - - - - - GLIGEN on canny grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_canny.pth",
-            prompt = "A Humanoid Robot Designed for Companionship", 
-            canny_image = 'inference_images/canny_robot.png',
-            alpha_type = [0.9, 0, 0.1], 
-            save_folder_name="canny"
-        ),
-
-
-
-
-        # - - - - - - - - GLIGEN on normal grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_normal.pth",
-            prompt = "a large tree with no leaves in front of a building", # 
-            normal = 'inference_images/normal_tree_building.jpg', # a normal map 
-            alpha_type = [0.7, 0, 0.3], 
-            save_folder_name="normal",
-        ),
-
-
-        # - - - - - - - - GLIGEN on depth grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_depth.pth",
-            prompt = "a Vibrant colorful Bird Sitting on Tree Branch", # 
-            depth = 'inference_images/depth_bird.png', 
-            alpha_type = [0.7, 0, 0.3], 
-            save_folder_name="depth"
-        ),
-
-
-        # - - - - - - - - GLIGEN on sem grounding for generation - - - - - - - - # 
-        dict(
-            ckpt ="../gligen_checkpoints/checkpoint_generation_sem.pth",
-            prompt = "a living room filled with lots of furniture and plants", # 
-            sem = 'inference_images/sem_ade_living_room.png', # ADE raw annotation  
-            alpha_type = [0.7, 0, 0.3], 
-            save_folder_name="sem"
-        ),
-
-
-
-        # - - - - - - - - GLIGEN on keypoint grounding for generation - - - - - - - - # 
-        dict(
-            ckpt = "../gligen_checkpoints/checkpoint_generation_keypoint.pth",
-            prompt = "A young man and a small boy are talking",
-            locations = [  
-                            [
-                                [0.7598, 0.2542],
-                                [0.7431, 0.2104],
-                                [0.8118, 0.2021],
-                                [0.0000, 0.0000],
-                                [0.9514, 0.1813],
-                                [0.7806, 0.2917],
-                                [0.0000, 0.0000],
-                                [0.6785, 0.5125],
-                                [0.0000, 0.0000],
-                                [0.5389, 0.6479],
-                                [0.6785, 0.6750],
-                                [0.7973, 0.7042],
-                                [0.0000, 0.0000],
-                                [0.6181, 0.7375],
-                                [0.9764, 0.8458],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000]
-                            ], 
-
-                            [
-                                [0.2681, 0.4313],
-                                [0.2514, 0.3979],
-                                [0.0000, 0.0000],
-                                [0.0785, 0.3854],
-                                [0.0000, 0.0000],
-                                [0.0910, 0.5583],
-                                [0.0000, 0.0000],
-                                [0.1243, 0.8479],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.0000, 0.0000],
-                                [0.2410, 0.8146],
-                                [0.1202, 0.6146],
-                                [0.0000, 0.0000],
-                                [0.2743, 0.7188]
-                            ], 
-
-             ],  # from id=18150 val set in coco2017k
-            alpha_type = [0.3, 0.0, 0.7],
-            save_folder_name="keypoint"
-        ),
-
-
-
     ]
 
+    #TODO: meta list 만들기. HICO 데이터셋 전체의 정보를 가지고 있는 meta list를 생성해야함.
 
-    starting_noise = torch.randn(args.batch_size, 4, 64, 64).to(device)
-    starting_noise = None
-    for meta in meta_list:
-        run(meta, args, starting_noise)
+
+    #* synchronization
+    if utils.get_world_size() > 1: dist.barrier() #for synchronization
+    
+    #* Data distribution in DDP (all custom_meta_list devide into four lists)
+    world_size = utils.get_world_size()
+    rank = utils.get_rank()
+    total_size = len(custom_meta_list)
+    per_process_size = total_size // world_size
+    start_idx = int(rank * per_process_size)
+    end_idx = int(start_idx + per_process_size if rank != world_size - 1 else total_size)
+    
+    #* GPU 별 분리된 데이터 로드
+    my_slice = custom_meta_list[start_idx:end_idx]
+    random.shuffle(my_slice)
+    
+    run(my_slice, args)
 
     
-
-
+    #* Completion message
+    print("Complete all generation")
+    if utils.get_world_size() > 1: dist.barrier()
+    
 
